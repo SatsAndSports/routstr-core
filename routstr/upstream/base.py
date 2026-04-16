@@ -579,7 +579,10 @@ class BaseUpstreamProvider:
                     try:
                         await adjust_payment_for_tokens(
                             fresh_key,
-                            {"model": last_model_seen or "unknown", "usage": None},
+                            {
+                                "model": requested_model or last_model_seen or "unknown",
+                                "usage": None,
+                            },
                             new_session,
                             max_cost_for_model,
                         )

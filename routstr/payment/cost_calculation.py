@@ -29,6 +29,19 @@ class CostDataError(BaseModel):
     code: str
 
 
+def _max_cost_fallback(max_cost: int) -> MaxCostData:
+    """Return a max-cost fallback that charges the reserved amount."""
+    return MaxCostData(
+        base_msats=max_cost,
+        input_msats=0,
+        output_msats=0,
+        total_msats=max_cost,
+        total_usd=0.0,
+        input_tokens=0,
+        output_tokens=0,
+    )
+
+
 async def calculate_cost(  # todo: can be sync
     response_data: dict, max_cost: int, session: AsyncSession
 ) -> CostData | MaxCostData | CostDataError:
@@ -53,23 +66,25 @@ async def calculate_cost(  # todo: can be sync
 
     if "usage" not in response_data or response_data["usage"] is None:
         logger.warning(
-            "No usage data in response, using base cost only",
+            "No usage data in response, using reserved max cost",
             extra={
                 "max_cost_msats": max_cost,
                 "model": response_data.get("model", "unknown"),
             },
         )
-        return MaxCostData(
-            base_msats=0,
-            input_msats=0,
-            output_msats=0,
-            total_msats=0,
-            total_usd=0.0,
-            input_tokens=0,
-            output_tokens=0,
-        )
+        return _max_cost_fallback(max_cost)
 
     usage_data = response_data["usage"]
+    if not isinstance(usage_data, dict):
+        logger.warning(
+            "Invalid usage data in response, using reserved max cost",
+            extra={
+                "max_cost_msats": max_cost,
+                "model": response_data.get("model", "unknown"),
+                "usage_type": type(usage_data).__name__,
+            },
+        )
+        return _max_cost_fallback(max_cost)
 
     def parse_token_count(value: object) -> int:
         if isinstance(value, bool):
@@ -130,6 +145,16 @@ async def calculate_cost(  # todo: can be sync
             usd_cost = float(usage_data.get("cost", 0) or 0)
         except Exception:
             pass
+
+    if usd_cost == 0 and input_tokens == 0 and output_tokens == 0:
+        logger.warning(
+            "Usage data had no billable metrics, using reserved max cost",
+            extra={
+                "max_cost_msats": max_cost,
+                "model": response_data.get("model", "unknown"),
+            },
+        )
+        return _max_cost_fallback(max_cost)
 
     MSATS_PER_1K_INPUT_TOKENS: float = (
         float(settings.fixed_per_1k_input_tokens) * 1000.0
@@ -245,14 +270,10 @@ async def calculate_cost(  # todo: can be sync
                 "model": response_data.get("model", "unknown"),
             },
         )
-        return MaxCostData(
-            base_msats=max_cost,
-            input_msats=0,
-            output_msats=0,
-            total_msats=max_cost,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-        )
+        cost = _max_cost_fallback(max_cost)
+        cost.input_tokens = input_tokens
+        cost.output_tokens = output_tokens
+        return cost
 
     calc_input_msats = round(input_tokens / 1000 * MSATS_PER_1K_INPUT_TOKENS, 3)
 

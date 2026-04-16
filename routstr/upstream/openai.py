@@ -73,9 +73,22 @@ class OpenAIUpstreamProvider(BaseUpstreamProvider):
         if not clean_path.endswith("chat/completions"):
             return False
 
+        body_updated = False
+
+        if data.get("stream") is True:
+            stream_options = data.get("stream_options")
+            if stream_options is None:
+                data["stream_options"] = {"include_usage": True}
+                body_updated = True
+            elif isinstance(stream_options, dict) and "include_usage" not in stream_options:
+                updated_stream_options = dict(stream_options)
+                updated_stream_options["include_usage"] = True
+                data["stream_options"] = updated_stream_options
+                body_updated = True
+
         tools = data.get("tools")
         if not isinstance(tools, list):
-            return False
+            return body_updated
 
         web_search_tools = [
             tool

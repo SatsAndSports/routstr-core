@@ -287,6 +287,36 @@ async def test_zero_free_balance_overrun_is_safe(
     assert key.reserved_balance >= 0, f"Reserved balance went negative: {key.reserved_balance}"
 
 
+@pytest.mark.asyncio
+async def test_missing_usage_charges_reserved_max_cost(
+    integration_session: AsyncSession,
+) -> None:
+    """Missing usage data should finalize at the reserved max cost, not zero."""
+    from routstr.auth import adjust_payment_for_tokens
+
+    deducted_max_cost = 1000
+
+    key = _make_key(balance=deducted_max_cost, reserved=deducted_max_cost)
+    integration_session.add(key)
+    await integration_session.commit()
+
+    response_data = {"model": "test-model", "usage": None}
+
+    await adjust_payment_for_tokens(
+        key, response_data, integration_session, deducted_max_cost
+    )
+
+    await _refresh(integration_session, key)
+
+    assert key.balance == 0, f"Expected balance=0, got {key.balance}"
+    assert key.reserved_balance == 0, (
+        f"Expected reserved_balance=0, got {key.reserved_balance}"
+    )
+    assert key.total_spent == deducted_max_cost, (
+        f"Expected total_spent={deducted_max_cost}, got {key.total_spent}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Test 6 — parallel requests: second finalization must not get free inference
 #

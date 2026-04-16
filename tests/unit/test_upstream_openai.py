@@ -59,6 +59,7 @@ def test_prepare_request_body_rewrites_openai_web_search_chat_request() -> None:
     assert data["model"] == "gpt-5-search-api"
     assert data["messages"] == [{"role": "user", "content": "Latest sports news"}]
     assert data["stream"] is True
+    assert data["stream_options"] == {"include_usage": True}
     assert data["web_search_options"] == {}
     assert "tools" not in data
 
@@ -106,6 +107,48 @@ def test_prepare_request_body_maps_web_search_options_for_chat_completions() -> 
         },
     }
     assert "tools" not in data
+
+
+def test_prepare_request_body_adds_stream_usage_for_openai_chat_streams() -> None:
+    provider = OpenAIUpstreamProvider(api_key="test-key")
+    model = create_test_model("gpt-5.4")
+
+    transformed = provider.prepare_request_body(
+        json.dumps(
+            {
+                "model": "gpt-5.4",
+                "messages": [{"role": "user", "content": "Stream normally"}],
+                "stream": True,
+            }
+        ).encode(),
+        model,
+        "chat/completions",
+    )
+
+    data = decode_body(transformed)
+    assert data["model"] == "gpt-5.4"
+    assert data["stream_options"] == {"include_usage": True}
+
+
+def test_prepare_request_body_preserves_existing_stream_usage_choice() -> None:
+    provider = OpenAIUpstreamProvider(api_key="test-key")
+    model = create_test_model("gpt-5.4")
+
+    transformed = provider.prepare_request_body(
+        json.dumps(
+            {
+                "model": "gpt-5.4",
+                "messages": [{"role": "user", "content": "Stream normally"}],
+                "stream": True,
+                "stream_options": {"include_usage": False, "foo": "bar"},
+            }
+        ).encode(),
+        model,
+        "chat/completions",
+    )
+
+    data = decode_body(transformed)
+    assert data["stream_options"] == {"include_usage": False, "foo": "bar"}
 
 
 def test_prepare_request_body_rejects_mixed_web_search_and_function_tools() -> None:
