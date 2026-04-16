@@ -82,7 +82,9 @@ class GeminiUpstreamProvider(BaseUpstreamProvider):
         if "/" in model_obj.id:
             model_obj.id = model_obj.id.split("/", 1)[1]
 
-        if not path.startswith("chat/completions"):
+        normalized_path = self.normalize_request_path(path, model_obj)
+
+        if not normalized_path.startswith("chat/completions"):
             return await super().forward_request(
                 request,
                 path,
@@ -110,7 +112,9 @@ class GeminiUpstreamProvider(BaseUpstreamProvider):
             openai_data = json.loads(request_body)
             messages = openai_data.get("messages", [])
             temperature = openai_data.get("temperature")
-            max_tokens = openai_data.get("max_tokens")
+            max_tokens = openai_data.get(
+                "max_completion_tokens", openai_data.get("max_tokens")
+            )
             top_p = openai_data.get("top_p")
             is_streaming = openai_data.get("stream", False)
 

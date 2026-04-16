@@ -250,6 +250,35 @@ class BaseUpstreamProvider:
         """
         return model_id
 
+    def uses_openai_chat_completion_limits(self) -> bool:
+        """Return whether this upstream expects OpenAI-style chat token limits."""
+        provider_type = (self.provider_type or "").lower()
+        if provider_type in {"openai", "azure"}:
+            return True
+
+        base_url = (self.base_url or "").lower()
+        return "api.openai.com" in base_url or "openai.azure.com" in base_url
+
+    def normalize_chat_completion_token_limits(
+        self, data: dict[str, object], path: str | None
+    ) -> bool:
+        """Rewrite deprecated OpenAI chat-completion token limit fields when needed."""
+        clean_path = (path or "").lstrip("/")
+        if not clean_path.endswith("chat/completions"):
+            return False
+
+        if not self.uses_openai_chat_completion_limits():
+            return False
+
+        if "max_completion_tokens" in data:
+            return data.pop("max_tokens", None) is not None
+
+        if "max_tokens" not in data:
+            return False
+
+        data["max_completion_tokens"] = data.pop("max_tokens")
+        return True
+
     def normalize_request_path(self, path: str, model_obj: Model | None = None) -> str:
         """Normalize request path before forwarding to upstream."""
         if path.startswith("v1/"):
@@ -326,7 +355,7 @@ class BaseUpstreamProvider:
         return body
 
     def prepare_request_body(
-        self, body: bytes | None, model_obj: Model
+        self, body: bytes | None, model_obj: Model, path: str | None = None
     ) -> bytes | None:
         """Transform request body for provider-specific requirements.
 
@@ -334,6 +363,8 @@ class BaseUpstreamProvider:
 
         Args:
             body: Original request body bytes
+            model_obj: Model object containing the original model information
+            path: Normalized upstream path for endpoint-specific body adjustments
 
         Returns:
             Transformed request body bytes
@@ -343,19 +374,28 @@ class BaseUpstreamProvider:
 
         try:
             data = json.loads(body)
-            if isinstance(data, dict) and "model" in data:
-                original_model = model_obj.id
-                transformed_model = self.transform_model_name(original_model)
-                data["model"] = transformed_model
-                logger.debug(
-                    "Transformed model name in request",
-                    extra={
-                        "original": original_model,
-                        "transformed": transformed_model,
-                        "provider": self.provider_type or self.base_url,
-                    },
-                )
-                return json.dumps(data).encode()
+            if isinstance(data, dict):
+                body_updated = False
+
+                if "model" in data:
+                    original_model = model_obj.id
+                    transformed_model = self.transform_model_name(original_model)
+                    data["model"] = transformed_model
+                    body_updated = True
+                    logger.debug(
+                        "Transformed model name in request",
+                        extra={
+                            "original": original_model,
+                            "transformed": transformed_model,
+                            "provider": self.provider_type or self.base_url,
+                        },
+                    )
+
+                if self.normalize_chat_completion_token_limits(data, path):
+                    body_updated = True
+
+                if body_updated:
+                    return json.dumps(data).encode()
         except Exception as e:
             logger.debug(
                 "Could not transform request body",
@@ -1424,7 +1464,7 @@ class BaseUpstreamProvider:
             (model_obj.forwarded_model_id or model_obj.id) if model_obj else None
         )
 
-        transformed_body = self.prepare_request_body(request_body, model_obj)
+        transformed_body = self.prepare_request_body(request_body, model_obj, path)
 
         logger.info(
             "Forwarding request to upstream",
@@ -2591,7 +2631,7 @@ class BaseUpstreamProvider:
         url = f"{self.base_url}/{path}"
 
         request_body = await request.body()
-        transformed_body = self.prepare_request_body(request_body, model_obj)
+        transformed_body = self.prepare_request_body(request_body, model_obj, path)
 
         logger.debug(
             "Forwarding request to upstream",

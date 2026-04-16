@@ -87,6 +87,7 @@ async def test_proxy_post_json_payload_forwarding(
         # Verify the request was forwarded correctly
         mock_send.assert_called_once()
         forwarded_request = mock_send.call_args[0][0]
+        forwarded_url = str(forwarded_request.url)
 
         # Check that payload was forwarded
         forwarded_body = forwarded_request.content.decode()
@@ -94,6 +95,13 @@ async def test_proxy_post_json_payload_forwarding(
         assert forwarded_json["model"] == test_payload["model"]
         assert forwarded_json["messages"] == test_payload["messages"]
         assert forwarded_json["temperature"] == test_payload["temperature"]
+
+        if "api.openai.com" in forwarded_url or "openai.azure.com" in forwarded_url:
+            assert forwarded_json["max_completion_tokens"] == test_payload["max_tokens"]
+            assert "max_tokens" not in forwarded_json
+        else:
+            assert forwarded_json["max_tokens"] == test_payload["max_tokens"]
+            assert "max_completion_tokens" not in forwarded_json
 
 
 @pytest.mark.integration

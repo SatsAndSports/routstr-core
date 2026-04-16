@@ -95,6 +95,19 @@ def get_provider_for_model(model_id: str) -> list[BaseUpstreamProvider] | None:
     return _provider_map.get(model_id.lower())
 
 
+def normalize_request_body_for_upstream(
+    request_body_dict: dict[str, Any],
+    upstream: BaseUpstreamProvider,
+    model_obj: Model,
+    path: str,
+) -> dict[str, Any]:
+    """Normalize request fields for the provider used for upfront reservation."""
+    normalized_body = dict(request_body_dict)
+    normalized_path = upstream.normalize_request_path(path, model_obj)
+    upstream.normalize_chat_completion_token_limits(normalized_body, normalized_path)
+    return normalized_body
+
+
 def get_unique_models() -> list[Model]:
     """Get list of unique models (no duplicates from aliases)."""
     return list(_unique_models.values())
@@ -182,19 +195,21 @@ async def proxy(
         )
 
     # todo figure out cost calculation since fallback provider is usually not the same price
-    # Use first provider for initial checks/cost calculation
-    # primary_upstream = upstreams[0]
+    primary_upstream = upstreams[0]
+    reservation_body_dict = normalize_request_body_for_upstream(
+        request_body_dict, primary_upstream, model_obj, path
+    )
 
     _max_cost_for_model = await get_max_cost_for_model(
         model=model_id, session=session, model_obj=model_obj
     )
     max_cost_for_model = await calculate_discounted_max_cost(
-        _max_cost_for_model, request_body_dict, model_obj=model_obj
+        _max_cost_for_model, reservation_body_dict, model_obj=model_obj
     )
     # Ensure max_cost_for_model is at least the minimum allowed request cost
     max_cost_for_model = max(max_cost_for_model, settings.min_request_msat)
 
-    check_token_balance(headers, request_body_dict, max_cost_for_model)
+    check_token_balance(headers, reservation_body_dict, max_cost_for_model)
 
     if x_cashu := headers.get("x-cashu", None):
         last_error = None
@@ -517,16 +532,34 @@ def parse_request_body_json(request_body: bytes, path: str) -> dict[str, Any]:
         try:
             request_body_dict = json.loads(request_body)
 
-            if "max_tokens" in request_body_dict:
-                max_tokens_value = request_body_dict["max_tokens"]
+            for token_field in ("max_tokens", "max_completion_tokens"):
+                if token_field not in request_body_dict:
+                    continue
 
-                if isinstance(max_tokens_value, int):
-                    pass
-                else:
-                    raise HTTPException(
-                        status_code=400,
-                        detail={"error": "max_tokens must be an integer"},
-                    )
+                token_value = request_body_dict[token_field]
+
+                if isinstance(token_value, int):
+                    continue
+
+                raise HTTPException(
+                    status_code=400,
+                    detail={"error": f"{token_field} must be an integer"},
+                )
+
+            if (
+                "max_tokens" in request_body_dict
+                and "max_completion_tokens" in request_body_dict
+                and request_body_dict["max_tokens"]
+                != request_body_dict["max_completion_tokens"]
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "error": (
+                            "max_tokens and max_completion_tokens must match when both are provided"
+                        )
+                    },
+                )
 
             logger.debug(
                 "Request body parsed",
