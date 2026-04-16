@@ -517,16 +517,34 @@ def parse_request_body_json(request_body: bytes, path: str) -> dict[str, Any]:
         try:
             request_body_dict = json.loads(request_body)
 
-            if "max_tokens" in request_body_dict:
-                max_tokens_value = request_body_dict["max_tokens"]
+            for token_field in ("max_tokens", "max_completion_tokens"):
+                if token_field not in request_body_dict:
+                    continue
 
-                if isinstance(max_tokens_value, int):
-                    pass
-                else:
-                    raise HTTPException(
-                        status_code=400,
-                        detail={"error": "max_tokens must be an integer"},
-                    )
+                token_value = request_body_dict[token_field]
+
+                if isinstance(token_value, int):
+                    continue
+
+                raise HTTPException(
+                    status_code=400,
+                    detail={"error": f"{token_field} must be an integer"},
+                )
+
+            if (
+                "max_tokens" in request_body_dict
+                and "max_completion_tokens" in request_body_dict
+                and request_body_dict["max_tokens"]
+                != request_body_dict["max_completion_tokens"]
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "error": (
+                            "max_tokens and max_completion_tokens must match when both are provided"
+                        )
+                    },
+                )
 
             logger.debug(
                 "Request body parsed",

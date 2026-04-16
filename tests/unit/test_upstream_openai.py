@@ -64,6 +64,51 @@ def test_prepare_request_body_rewrites_openai_web_search_chat_request() -> None:
     assert "tools" not in data
 
 
+def test_prepare_request_body_rewrites_max_tokens_for_openai_chat_completions() -> None:
+    provider = OpenAIUpstreamProvider(api_key="test-key")
+    model = create_test_model("gpt-5.4")
+
+    transformed = provider.prepare_request_body(
+        json.dumps(
+            {
+                "model": "gpt-5.4",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "max_tokens": 128,
+            }
+        ).encode(),
+        model,
+        "chat/completions",
+    )
+
+    data = decode_body(transformed)
+    assert data["model"] == "gpt-5.4"
+    assert data["max_completion_tokens"] == 128
+    assert "max_tokens" not in data
+
+
+def test_prepare_request_body_prefers_existing_max_completion_tokens() -> None:
+    provider = OpenAIUpstreamProvider(api_key="test-key")
+    model = create_test_model("gpt-5.4")
+
+    transformed = provider.prepare_request_body(
+        json.dumps(
+            {
+                "model": "gpt-5.4",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "max_tokens": 256,
+                "max_completion_tokens": 64,
+            }
+        ).encode(),
+        model,
+        "chat/completions",
+    )
+
+    data = decode_body(transformed)
+    assert data["model"] == "gpt-5.4"
+    assert data["max_completion_tokens"] == 64
+    assert "max_tokens" not in data
+
+
 def test_prepare_request_body_maps_web_search_options_for_chat_completions() -> None:
     provider = OpenAIUpstreamProvider(api_key="test-key")
     model = create_test_model("gpt-5.4")

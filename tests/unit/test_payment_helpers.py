@@ -7,7 +7,10 @@ os.environ["UPSTREAM_BASE_URL"] = "http://test"
 os.environ["UPSTREAM_API_KEY"] = "test"
 
 from routstr.core.settings import settings  # noqa: E402
-from routstr.payment.helpers import get_max_cost_for_model  # noqa: E402
+from routstr.payment.helpers import (  # noqa: E402
+    calculate_discounted_max_cost,
+    get_max_cost_for_model,
+)
 
 
 async def test_get_max_cost_for_model_known() -> None:
@@ -125,3 +128,37 @@ async def test_get_max_cost_for_model_tolerance() -> None:
                 "gpt-4", session=mock_session, model_obj=mock_model
             )
             assert cost == 450000  # 500 sats * 1000 * 0.9 = 450000
+
+
+async def test_calculate_discounted_max_cost_prefers_max_completion_tokens() -> None:
+    from routstr.payment.models import Pricing
+
+    mock_pricing = Pricing(
+        prompt=1.0,
+        completion=2.0,
+        request=0.0,
+        image=0.0,
+        web_search=0.0,
+        internal_reasoning=0.0,
+        max_prompt_cost=0.0,
+        max_completion_cost=100.0,
+        max_cost=100.0,
+    )
+    mock_model = Mock()
+    mock_model.sats_pricing = mock_pricing
+    mock_model.top_provider = None
+    mock_model.context_length = None
+
+    body = {
+        "model": "gpt-4o",
+        "max_completion_tokens": 10,
+        "max_tokens": 50,
+    }
+
+    with patch.object(settings, "fixed_pricing", False):
+        with patch.object(settings, "tolerance_percentage", 0):
+            adjusted = await calculate_discounted_max_cost(
+                100000, body, model_obj=mock_model
+            )
+
+    assert adjusted == 20000

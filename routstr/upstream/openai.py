@@ -86,6 +86,12 @@ class OpenAIUpstreamProvider(BaseUpstreamProvider):
                 data["stream_options"] = updated_stream_options
                 body_updated = True
 
+        if "max_completion_tokens" in data:
+            body_updated = data.pop("max_tokens", None) is not None or body_updated
+        elif "max_tokens" in data:
+            data["max_completion_tokens"] = data.pop("max_tokens")
+            body_updated = True
+
         tools = data.get("tools")
         if not isinstance(tools, list):
             return body_updated
