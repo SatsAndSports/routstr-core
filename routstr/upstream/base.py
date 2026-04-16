@@ -250,6 +250,34 @@ class BaseUpstreamProvider:
         """
         return model_id
 
+    def transform_chat_completions_request(
+        self,
+        data: dict[str, object],
+        path: str | None,
+        model_obj: Model,
+    ) -> bool:
+        """Apply provider-specific chat-completions request transforms.
+
+        Returns True when the body was modified.
+        """
+        return False
+
+    @staticmethod
+    def get_http_exception_error(exc: HTTPException) -> tuple[str, str]:
+        """Extract error type and message from an HTTPException."""
+        error_type = "invalid_request_error"
+        message = str(exc.detail)
+
+        if isinstance(exc.detail, dict):
+            error = exc.detail.get("error")
+            if isinstance(error, dict):
+                error_type = str(error.get("type", error_type))
+                message = str(error.get("message", message))
+            elif "message" in exc.detail:
+                message = str(exc.detail["message"])
+
+        return error_type, message
+
     def normalize_request_path(self, path: str, model_obj: Model | None = None) -> str:
         """Normalize request path before forwarding to upstream."""
         if path.startswith("v1/"):
@@ -326,7 +354,7 @@ class BaseUpstreamProvider:
         return body
 
     def prepare_request_body(
-        self, body: bytes | None, model_obj: Model
+        self, body: bytes | None, model_obj: Model, path: str | None = None
     ) -> bytes | None:
         """Transform request body for provider-specific requirements.
 
@@ -334,6 +362,8 @@ class BaseUpstreamProvider:
 
         Args:
             body: Original request body bytes
+            model_obj: Model object containing the original model information
+            path: Normalized request path for endpoint-specific transformations
 
         Returns:
             Transformed request body bytes
@@ -343,19 +373,30 @@ class BaseUpstreamProvider:
 
         try:
             data = json.loads(body)
-            if isinstance(data, dict) and "model" in data:
-                original_model = model_obj.id
-                transformed_model = self.transform_model_name(original_model)
-                data["model"] = transformed_model
-                logger.debug(
-                    "Transformed model name in request",
-                    extra={
-                        "original": original_model,
-                        "transformed": transformed_model,
-                        "provider": self.provider_type or self.base_url,
-                    },
-                )
-                return json.dumps(data).encode()
+            if isinstance(data, dict):
+                body_updated = False
+
+                if "model" in data:
+                    original_model = model_obj.id
+                    transformed_model = self.transform_model_name(original_model)
+                    data["model"] = transformed_model
+                    body_updated = True
+                    logger.debug(
+                        "Transformed model name in request",
+                        extra={
+                            "original": original_model,
+                            "transformed": transformed_model,
+                            "provider": self.provider_type or self.base_url,
+                        },
+                    )
+
+                if self.transform_chat_completions_request(data, path, model_obj):
+                    body_updated = True
+
+                if body_updated:
+                    return json.dumps(data).encode()
+        except HTTPException:
+            raise
         except Exception as e:
             logger.debug(
                 "Could not transform request body",
@@ -1424,7 +1465,26 @@ class BaseUpstreamProvider:
             (model_obj.forwarded_model_id or model_obj.id) if model_obj else None
         )
 
-        transformed_body = self.prepare_request_body(request_body, model_obj)
+        try:
+            transformed_body = self.prepare_request_body(request_body, model_obj, path)
+        except HTTPException as exc:
+            error_type, message = self.get_http_exception_error(exc)
+            logger.warning(
+                "Rejected request before upstream forwarding",
+                extra={
+                    "path": path,
+                    "provider": self.provider_type or self.base_url,
+                    "status_code": exc.status_code,
+                    "error_type": error_type,
+                    "error_message": message,
+                },
+            )
+            return create_error_response(
+                error_type,
+                message,
+                exc.status_code,
+                request=request,
+            )
 
         logger.info(
             "Forwarding request to upstream",
@@ -2591,7 +2651,37 @@ class BaseUpstreamProvider:
         url = f"{self.base_url}/{path}"
 
         request_body = await request.body()
-        transformed_body = self.prepare_request_body(request_body, model_obj)
+        try:
+            transformed_body = self.prepare_request_body(request_body, model_obj, path)
+        except HTTPException as exc:
+            error_type, message = self.get_http_exception_error(exc)
+            logger.warning(
+                "Rejected X-Cashu request before upstream forwarding",
+                extra={
+                    "path": path,
+                    "provider": self.provider_type or self.base_url,
+                    "status_code": exc.status_code,
+                    "error_type": error_type,
+                    "error_message": message,
+                    "amount": amount,
+                    "unit": unit,
+                },
+            )
+
+            refund_token = await self.send_refund(
+                amount,
+                unit,
+                mint,
+                payment_token_hash,
+                request_id=getattr(request.state, "request_id", None),
+            )
+            return create_error_response(
+                error_type,
+                message,
+                exc.status_code,
+                request=request,
+                token=refund_token,
+            )
 
         logger.debug(
             "Forwarding request to upstream",
