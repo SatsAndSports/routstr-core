@@ -1,7 +1,7 @@
 import json
 import time
 import uuid
-from typing import TYPE_CHECKING, Any, AsyncGenerator
+from typing import TYPE_CHECKING, AsyncGenerator
 
 from fastapi import HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
@@ -285,6 +285,12 @@ class OpenAIUpstreamProvider(BaseUpstreamProvider):
             return False
 
         return any(isinstance(tool, dict) and tool.get("type") == "function" for tool in tools)
+
+    def should_bridge_messages_to_responses(
+        self, data: dict[str, object], path: str | None
+    ) -> bool:
+        clean_path = (path or "").lstrip("/")
+        return clean_path.endswith("messages")
 
     def _translate_chat_input_content(self, content: object) -> list[dict[str, object]]:
         if content is None:
@@ -825,6 +831,770 @@ class OpenAIUpstreamProvider(BaseUpstreamProvider):
 
         return chat_response
 
+    def _stringify_messages_tool_result_content(self, content: object) -> str:
+        if content is None:
+            return ""
+
+        if isinstance(content, str):
+            return content
+
+        if isinstance(content, list):
+            text_parts: list[str] = []
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    text_parts.append(str(part.get("text", "")))
+                else:
+                    return json.dumps(content)
+            return "".join(text_parts)
+
+        return json.dumps(content)
+
+    def _parse_response_function_arguments(self, arguments: object) -> dict[str, object]:
+        if isinstance(arguments, dict):
+            return dict(arguments)
+
+        if not isinstance(arguments, str):
+            return {}
+
+        try:
+            parsed = json.loads(arguments)
+        except json.JSONDecodeError:
+            return {"raw": arguments}
+
+        if isinstance(parsed, dict):
+            return parsed
+        return {"value": parsed}
+
+    def _build_responses_message_item(
+        self, role: str, content: list[dict[str, object]]
+    ) -> dict[str, object]:
+        item: dict[str, object] = {
+            "type": "message",
+            "role": role,
+            "content": content,
+        }
+        if role == "assistant":
+            item["status"] = "completed"
+        return item
+
+    def _translate_messages_content_to_responses_items(
+        self, role: str, content: object
+    ) -> list[dict[str, object]]:
+        if content is None:
+            return []
+
+        if isinstance(content, str):
+            part_type = "output_text" if role == "assistant" else "input_text"
+            return [
+                self._build_responses_message_item(
+                    role,
+                    [{"type": part_type, "text": content}],
+                )
+            ]
+
+        if not isinstance(content, list):
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": {
+                        "message": (
+                            "OpenAI messages-to-responses bridge only supports string or list message content"
+                        ),
+                        "type": "invalid_request_error",
+                    }
+                },
+            )
+
+        translated_items: list[dict[str, object]] = []
+        current_parts: list[dict[str, object]] = []
+
+        def flush_parts() -> None:
+            nonlocal current_parts
+            if current_parts:
+                translated_items.append(
+                    self._build_responses_message_item(role, current_parts)
+                )
+                current_parts = []
+
+        for block in content:
+            if not isinstance(block, dict):
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "error": {
+                            "message": (
+                                "OpenAI messages-to-responses bridge received an invalid content block"
+                            ),
+                            "type": "invalid_request_error",
+                        }
+                    },
+                )
+
+            block_type = block.get("type")
+            if block_type == "text":
+                part_type = "output_text" if role == "assistant" else "input_text"
+                current_parts.append(
+                    {"type": part_type, "text": str(block.get("text", ""))}
+                )
+                continue
+
+            if block_type == "tool_use":
+                if role != "assistant":
+                    raise HTTPException(
+                        status_code=400,
+                        detail={
+                            "error": {
+                                "message": (
+                                    "OpenAI messages-to-responses bridge only supports assistant tool_use blocks"
+                                ),
+                                "type": "invalid_request_error",
+                            }
+                        },
+                    )
+
+                flush_parts()
+                call_id = block.get("id")
+                name = block.get("name")
+                input_data = block.get("input", {})
+                if (
+                    not isinstance(call_id, str)
+                    or not isinstance(name, str)
+                    or not isinstance(input_data, dict)
+                ):
+                    raise HTTPException(
+                        status_code=400,
+                        detail={
+                            "error": {
+                                "message": (
+                                    "OpenAI messages-to-responses bridge requires tool_use blocks to include id, name, and object input"
+                                ),
+                                "type": "invalid_request_error",
+                            }
+                        },
+                    )
+
+                translated_items.append(
+                    {
+                        "type": "function_call",
+                        "call_id": call_id,
+                        "name": name,
+                        "arguments": json.dumps(input_data),
+                        "status": "completed",
+                    }
+                )
+                continue
+
+            if block_type == "tool_result":
+                if role != "user":
+                    raise HTTPException(
+                        status_code=400,
+                        detail={
+                            "error": {
+                                "message": (
+                                    "OpenAI messages-to-responses bridge only supports user tool_result blocks"
+                                ),
+                                "type": "invalid_request_error",
+                            }
+                        },
+                    )
+
+                flush_parts()
+                tool_use_id = block.get("tool_use_id")
+                if not isinstance(tool_use_id, str):
+                    raise HTTPException(
+                        status_code=400,
+                        detail={
+                            "error": {
+                                "message": (
+                                    "OpenAI messages-to-responses bridge requires tool_result blocks to include tool_use_id"
+                                ),
+                                "type": "invalid_request_error",
+                            }
+                        },
+                    )
+
+                translated_items.append(
+                    {
+                        "type": "function_call_output",
+                        "call_id": tool_use_id,
+                        "output": self._stringify_messages_tool_result_content(
+                            block.get("content")
+                        ),
+                    }
+                )
+                continue
+
+            if block_type in {"thinking", "redacted_thinking"} and role == "assistant":
+                continue
+
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": {
+                        "message": (
+                            "OpenAI messages-to-responses bridge does not support content block type "
+                            f"'{block_type}'"
+                        ),
+                        "type": "invalid_request_error",
+                    }
+                },
+            )
+
+        flush_parts()
+        return translated_items
+
+    def _translate_messages_to_responses_input(
+        self, system: object, messages: object
+    ) -> list[dict[str, object]]:
+        if not isinstance(messages, list):
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": {
+                        "message": "OpenAI messages-to-responses bridge requires a messages array",
+                        "type": "invalid_request_error",
+                    }
+                },
+            )
+
+        translated_input: list[dict[str, object]] = []
+        if system is not None:
+            translated_input.extend(
+                self._translate_messages_content_to_responses_items("system", system)
+            )
+
+        for message in messages:
+            if not isinstance(message, dict):
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "error": {
+                            "message": (
+                                "OpenAI messages-to-responses bridge received an invalid message entry"
+                            ),
+                            "type": "invalid_request_error",
+                        }
+                    },
+                )
+
+            role = message.get("role")
+            if role not in {"user", "assistant"}:
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "error": {
+                            "message": (
+                                "OpenAI messages-to-responses bridge does not support message role "
+                                f"'{role}'"
+                            ),
+                            "type": "invalid_request_error",
+                        }
+                    },
+                )
+
+            translated_input.extend(
+                self._translate_messages_content_to_responses_items(
+                    str(role), message.get("content")
+                )
+            )
+
+        return translated_input
+
+    def _translate_messages_tools_to_responses_tools(
+        self, tools: object
+    ) -> list[dict[str, object]]:
+        if not isinstance(tools, list):
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": {
+                        "message": "OpenAI messages-to-responses bridge requires a tools array",
+                        "type": "invalid_request_error",
+                    }
+                },
+            )
+
+        translated_tools: list[dict[str, object]] = []
+        for tool in tools:
+            if not isinstance(tool, dict):
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "error": {
+                            "message": (
+                                "OpenAI messages-to-responses bridge received an invalid tool definition"
+                            ),
+                            "type": "invalid_request_error",
+                        }
+                    },
+                )
+
+            tool_type = tool.get("type")
+            if tool_type not in (None, "custom"):
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "error": {
+                            "message": (
+                                "OpenAI messages-to-responses bridge only supports custom function tools"
+                            ),
+                            "type": "invalid_request_error",
+                        }
+                    },
+                )
+
+            name = tool.get("name")
+            parameters = tool.get("input_schema", {"type": "object", "properties": {}})
+            if not isinstance(name, str) or not isinstance(parameters, dict):
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "error": {
+                            "message": (
+                                "OpenAI messages-to-responses bridge requires tools to include name and object input_schema"
+                            ),
+                            "type": "invalid_request_error",
+                        }
+                    },
+                )
+
+            translated_tool: dict[str, object] = {
+                "type": "function",
+                "name": name,
+                "parameters": parameters,
+            }
+            if description := tool.get("description"):
+                translated_tool["description"] = description
+            translated_tools.append(translated_tool)
+
+        return translated_tools
+
+    def _translate_messages_tool_choice_to_responses(self, tool_choice: object) -> object:
+        if isinstance(tool_choice, str):
+            mapping = {
+                "auto": "auto",
+                "any": "required",
+                "required": "required",
+                "none": "none",
+            }
+            if tool_choice in mapping:
+                return mapping[tool_choice]
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": {
+                        "message": (
+                            "OpenAI messages-to-responses bridge does not support tool_choice "
+                            f"'{tool_choice}'"
+                        ),
+                        "type": "invalid_request_error",
+                    }
+                },
+            )
+
+        if isinstance(tool_choice, dict):
+            tool_choice_type = tool_choice.get("type")
+            if tool_choice_type == "auto":
+                return "auto"
+            if tool_choice_type == "any":
+                return "required"
+            if tool_choice_type == "none":
+                return "none"
+            if tool_choice_type == "tool" and isinstance(tool_choice.get("name"), str):
+                return {"type": "function", "name": tool_choice["name"]}
+
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": {
+                        "message": (
+                            "OpenAI messages-to-responses bridge received an unsupported tool_choice object"
+                        ),
+                        "type": "invalid_request_error",
+                    }
+                },
+            )
+
+        return tool_choice
+
+    def _apply_messages_output_config(
+        self, translated: dict[str, object], output_config: object
+    ) -> None:
+        if output_config is None:
+            return
+
+        if not isinstance(output_config, dict):
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": {
+                        "message": (
+                            "OpenAI messages-to-responses bridge requires output_config to be an object"
+                        ),
+                        "type": "invalid_request_error",
+                    }
+                },
+            )
+
+        effort = output_config.get("effort")
+        if effort is not None:
+            translated["reasoning"] = {"effort": effort}
+
+        format_config = output_config.get("format")
+        if format_config is None:
+            return
+
+        if not isinstance(format_config, dict):
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": {
+                        "message": (
+                            "OpenAI messages-to-responses bridge requires output_config.format to be an object"
+                        ),
+                        "type": "invalid_request_error",
+                    }
+                },
+            )
+
+        format_type = format_config.get("type")
+        if format_type == "json_schema":
+            schema = format_config.get("schema")
+            if not isinstance(schema, dict):
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "error": {
+                            "message": (
+                                "OpenAI messages-to-responses bridge requires output_config.format.schema to be an object"
+                            ),
+                            "type": "invalid_request_error",
+                        }
+                    },
+                )
+
+            text_format: dict[str, object] = {
+                "type": "json_schema",
+                "name": str(format_config.get("name") or "anthropic_output"),
+                "schema": schema,
+            }
+            if description := format_config.get("description"):
+                text_format["description"] = description
+            if "strict" in format_config:
+                text_format["strict"] = format_config["strict"]
+            translated["text"] = {"format": text_format}
+            return
+
+        if format_type == "json_object":
+            translated["text"] = {"format": {"type": "json_object"}}
+            return
+
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": {
+                    "message": (
+                        "OpenAI messages-to-responses bridge does not support output_config.format type "
+                        f"'{format_type}'"
+                    ),
+                    "type": "invalid_request_error",
+                }
+            },
+        )
+
+    def translate_messages_to_responses_request(
+        self, data: dict[str, object], model_obj: Model
+    ) -> dict[str, object]:
+        translated: dict[str, object] = {
+            "model": self.transform_model_name(model_obj.id),
+            "input": self._translate_messages_to_responses_input(
+                data.get("system"), data.get("messages")
+            ),
+            "stream": False,
+        }
+
+        if "tools" in data:
+            translated["tools"] = self._translate_messages_tools_to_responses_tools(
+                data.get("tools")
+            )
+
+        if "tool_choice" in data:
+            translated["tool_choice"] = self._translate_messages_tool_choice_to_responses(
+                data.get("tool_choice")
+            )
+
+        self._apply_messages_output_config(translated, data.get("output_config"))
+
+        max_output_tokens = data.get("max_tokens")
+        if max_output_tokens is not None:
+            translated["max_output_tokens"] = max_output_tokens
+
+        passthrough_fields = ("temperature", "top_p", "metadata", "service_tier")
+        for field in passthrough_fields:
+            if field in data:
+                translated[field] = data[field]
+
+        if "stop_sequences" in data:
+            translated["stop"] = data["stop_sequences"]
+
+        return translated
+
+    def _responses_usage_to_messages_usage(
+        self, usage: object
+    ) -> dict[str, object] | None:
+        if not isinstance(usage, dict):
+            return None
+
+        messages_usage: dict[str, object] = {
+            "input_tokens": int(usage.get("input_tokens") or 0),
+            "output_tokens": int(usage.get("output_tokens") or 0),
+        }
+
+        for key in (
+            "cache_creation_input_tokens",
+            "cache_read_input_tokens",
+            "reasoning_tokens",
+            "cost",
+            "cost_sats",
+            "remaining_balance_msats",
+        ):
+            if key in usage:
+                messages_usage[key] = usage[key]
+
+        return messages_usage
+
+    def convert_responses_to_messages_json(
+        self, response_json: dict[str, object]
+    ) -> dict[str, object]:
+        output = response_json.get("output")
+        content_blocks: list[dict[str, object]] = []
+        stop_reason = "end_turn"
+
+        if isinstance(output, list):
+            for item in output:
+                if not isinstance(item, dict):
+                    continue
+
+                item_type = item.get("type")
+                if item_type == "message" and item.get("role") == "assistant":
+                    content = item.get("content")
+                    if not isinstance(content, list):
+                        continue
+
+                    for part in content:
+                        if not isinstance(part, dict):
+                            continue
+                        part_type = part.get("type")
+                        if part_type == "output_text":
+                            content_blocks.append(
+                                {"type": "text", "text": str(part.get("text", ""))}
+                            )
+                        elif part_type == "refusal":
+                            content_blocks.append(
+                                {
+                                    "type": "text",
+                                    "text": str(part.get("refusal", "")),
+                                }
+                            )
+                elif item_type == "function_call":
+                    name = item.get("name")
+                    if not isinstance(name, str):
+                        continue
+
+                    call_id = item.get("call_id") or item.get("id")
+                    if not isinstance(call_id, str):
+                        call_id = f"toolu_{uuid.uuid4().hex}"
+
+                    content_blocks.append(
+                        {
+                            "type": "tool_use",
+                            "id": call_id,
+                            "name": name,
+                            "input": self._parse_response_function_arguments(
+                                item.get("arguments")
+                            ),
+                        }
+                    )
+                    stop_reason = "tool_use"
+
+        if stop_reason != "tool_use" and response_json.get("status") == "incomplete":
+            incomplete_details = response_json.get("incomplete_details")
+            if (
+                isinstance(incomplete_details, dict)
+                and incomplete_details.get("reason") == "max_output_tokens"
+            ):
+                stop_reason = "max_tokens"
+
+        message_response: dict[str, object] = {
+            "id": response_json.get("id") or f"msg_{uuid.uuid4()}",
+            "type": "message",
+            "role": "assistant",
+            "model": response_json.get("model", "unknown"),
+            "content": content_blocks,
+            "stop_reason": stop_reason,
+            "stop_sequence": None,
+        }
+
+        if usage := self._responses_usage_to_messages_usage(response_json.get("usage")):
+            message_response["usage"] = usage
+
+        if metadata := response_json.get("metadata"):
+            message_response["metadata"] = metadata
+
+        if cost := response_json.get("cost"):
+            message_response["cost"] = cost
+
+        return message_response
+
+    def _build_synthetic_messages_stream_headers(
+        self, response: Response
+    ) -> dict[str, str]:
+        response_headers = {
+            key: value
+            for key, value in response.headers.items()
+            if key.lower().startswith("access-control-")
+            or key.lower() in {"cache-control", "vary"}
+        }
+        response_headers["content-type"] = "text/event-stream"
+        return response_headers
+
+    def _build_synthetic_messages_stream(
+        self, message_response: dict[str, object]
+    ) -> AsyncGenerator[bytes, None]:
+        async def stream() -> AsyncGenerator[bytes, None]:
+            message_id = str(message_response.get("id") or f"msg_{uuid.uuid4()}")
+            model = str(message_response.get("model", "unknown"))
+            usage = message_response.get("usage")
+            if not isinstance(usage, dict):
+                usage = {}
+
+            start_usage: dict[str, object] = {
+                "input_tokens": int(usage.get("input_tokens") or 0)
+            }
+            for key in ("cache_creation_input_tokens", "cache_read_input_tokens"):
+                if key in usage:
+                    start_usage[key] = usage[key]
+
+            message_start = {
+                "type": "message_start",
+                "message": {
+                    "id": message_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "model": model,
+                    "content": [],
+                    "stop_reason": None,
+                    "stop_sequence": None,
+                    "usage": start_usage,
+                },
+            }
+            yield (
+                f"event: message_start\ndata: {json.dumps(message_start)}\n\n".encode()
+            )
+
+            content_blocks = message_response.get("content")
+            if not isinstance(content_blocks, list):
+                content_blocks = []
+
+            for index, block in enumerate(content_blocks):
+                if not isinstance(block, dict):
+                    continue
+
+                block_type = block.get("type")
+                if block_type == "text":
+                    yield (
+                        "event: content_block_start\ndata: "
+                        + json.dumps(
+                            {
+                                "type": "content_block_start",
+                                "index": index,
+                                "content_block": {"type": "text", "text": ""},
+                            }
+                        )
+                        + "\n\n"
+                    ).encode()
+                    yield (
+                        "event: content_block_delta\ndata: "
+                        + json.dumps(
+                            {
+                                "type": "content_block_delta",
+                                "index": index,
+                                "delta": {
+                                    "type": "text_delta",
+                                    "text": str(block.get("text", "")),
+                                },
+                            }
+                        )
+                        + "\n\n"
+                    ).encode()
+                    yield (
+                        "event: content_block_stop\ndata: "
+                        + json.dumps({"type": "content_block_stop", "index": index})
+                        + "\n\n"
+                    ).encode()
+                    continue
+
+                if block_type == "tool_use":
+                    input_data = block.get("input")
+                    if not isinstance(input_data, dict):
+                        input_data = {}
+
+                    yield (
+                        "event: content_block_start\ndata: "
+                        + json.dumps(
+                            {
+                                "type": "content_block_start",
+                                "index": index,
+                                "content_block": {
+                                    "type": "tool_use",
+                                    "id": block.get("id"),
+                                    "name": block.get("name"),
+                                    "input": {},
+                                },
+                            }
+                        )
+                        + "\n\n"
+                    ).encode()
+
+                    if input_data:
+                        yield (
+                            "event: content_block_delta\ndata: "
+                            + json.dumps(
+                                {
+                                    "type": "content_block_delta",
+                                    "index": index,
+                                    "delta": {
+                                        "type": "input_json_delta",
+                                        "partial_json": json.dumps(
+                                            input_data, separators=(",", ":")
+                                        ),
+                                    },
+                                }
+                            )
+                            + "\n\n"
+                        ).encode()
+
+                    yield (
+                        "event: content_block_stop\ndata: "
+                        + json.dumps({"type": "content_block_stop", "index": index})
+                        + "\n\n"
+                    ).encode()
+
+            message_delta = {
+                "type": "message_delta",
+                "delta": {
+                    "stop_reason": message_response.get("stop_reason", "end_turn"),
+                    "stop_sequence": message_response.get("stop_sequence"),
+                },
+                "usage": {"output_tokens": int(usage.get("output_tokens") or 0)},
+            }
+            yield (
+                f"event: message_delta\ndata: {json.dumps(message_delta)}\n\n".encode()
+            )
+            yield b'event: message_stop\ndata: {"type": "message_stop"}\n\n'
+
+        return stream()
+
     def _build_synthetic_chat_stream_headers(self, response: Response) -> dict[str, str]:
         response_headers = {
             key: value
@@ -987,9 +1757,103 @@ class OpenAIUpstreamProvider(BaseUpstreamProvider):
                 model_obj,
             )
 
-        if not isinstance(request_data, dict) or not self.should_bridge_chat_completions_to_responses(
-            request_data, path
-        ):
+        if not isinstance(request_data, dict):
+            return await super().forward_request(
+                request,
+                path,
+                headers,
+                request_body,
+                key,
+                max_cost_for_model,
+                session,
+                model_obj,
+            )
+
+        if self.should_bridge_messages_to_responses(request_data, path):
+            try:
+                bridged_request = self.translate_messages_to_responses_request(
+                    request_data, model_obj
+                )
+            except HTTPException as exc:
+                error_type, message = self.get_http_exception_error(exc)
+                logger.warning(
+                    "Rejected OpenAI messages-to-responses bridge request",
+                    extra={
+                        "path": path,
+                        "status_code": exc.status_code,
+                        "error_type": error_type,
+                        "error_message": message,
+                    },
+                )
+                return create_error_response(
+                    error_type,
+                    message,
+                    exc.status_code,
+                    request=request,
+                )
+
+            logger.info(
+                "Bridging OpenAI messages request to Responses API",
+                extra={
+                    "path": path,
+                    "requested_model": request_data.get("model", "unknown"),
+                    "upstream_model": bridged_request.get("model", "unknown"),
+                    "client_wants_streaming": bool(request_data.get("stream")),
+                    "tool_count": len(request_data.get("tools", []))
+                    if isinstance(request_data.get("tools"), list)
+                    else 0,
+                },
+            )
+
+            bridged_response = await self.forward_responses_request(
+                request,
+                "v1/responses",
+                headers,
+                json.dumps(bridged_request).encode(),
+                key,
+                max_cost_for_model,
+                session,
+                model_obj,
+            )
+
+            if bridged_response.status_code != 200:
+                return bridged_response
+
+            if isinstance(bridged_response, StreamingResponse):
+                return bridged_response
+
+            try:
+                bridged_json = json.loads(bridged_response.body)
+            except Exception:
+                return bridged_response
+
+            if not isinstance(bridged_json, dict):
+                return bridged_response
+
+            messages_response = self.convert_responses_to_messages_json(bridged_json)
+            if bool(request_data.get("stream")):
+                return StreamingResponse(
+                    self._build_synthetic_messages_stream(messages_response),
+                    status_code=200,
+                    headers=self._build_synthetic_messages_stream_headers(
+                        bridged_response
+                    ),
+                )
+
+            response_headers = {
+                key: value
+                for key, value in bridged_response.headers.items()
+                if key.lower() not in {"content-length", "content-encoding"}
+            }
+            response_headers["content-type"] = "application/json"
+            return Response(
+                content=json.dumps(messages_response).encode(),
+                status_code=200,
+                headers=response_headers,
+                media_type="application/json",
+            )
+
+        if not self.should_bridge_chat_completions_to_responses(request_data, path):
             return await super().forward_request(
                 request,
                 path,
